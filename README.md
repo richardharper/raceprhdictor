@@ -7,9 +7,9 @@ Marathon finish time predictor powered by your Strava data.
 ### 1. Create a Strava API Application
 
 1. Go to [strava.com/settings/api](https://www.strava.com/settings/api)
-2. Fill in any app name (e.g. "Metathon")
+2. Fill in any app name (e.g. "Raceprhdictor")
 3. Set **Category** to Training
-4. Set **Website** to your Vercel URL (e.g. `https://metathon.vercel.app`) — you can update this after deploy
+4. Set **Website** to your Vercel URL (e.g. `https://raceprhdictor.vercel.app`) — you can update this after deploy
 5. Set **Authorization Callback Domain** to your Vercel domain (e.g. `metathon.vercel.app`)
 6. Note down your **Client ID** and **Client Secret**
 
@@ -35,7 +35,7 @@ Set these environment variables in Vercel's dashboard (Settings → Environment 
 ### 3. Register your callback URL with Strava
 
 Back in your Strava API app settings, add your deployed URL as the callback domain:
-- `metathon.vercel.app` (or whatever your Vercel URL is)
+- `raceprhdictor.vercel.app` (or whatever your Vercel URL is)
 
 That's it. Visit your app and click "Connect with Strava."
 
