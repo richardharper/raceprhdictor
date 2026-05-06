@@ -1,4 +1,4 @@
-# Metathon
+# Race Predictor
 
 Marathon finish time predictor powered by your Strava data.
 
