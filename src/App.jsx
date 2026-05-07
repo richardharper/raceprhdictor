@@ -77,35 +77,44 @@ const ls  = { get: (k) => { try { const v = localStorage.getItem(k); return v ? 
               set: (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
               del: (k)   => { try { localStorage.removeItem(k); } catch {} } };
 
-// ── Prediction: Riegel formula, recency + distance weighted ──────────────────
+// ── Prediction ────────────────────────────────────────────────────────────────
+// Riegel formula weighted by recency, intensity, and distance similarity.
+// The key improvement over a naive weighted average is the intensity weight:
+// runs done at faster (race-like) paces dominate the prediction, while easy
+// and recovery miles contribute very little. This mirrors how Strava/Garmin
+// anchor predictions to your best efforts rather than your junk miles.
 function predictRace(activities, targetM) {
+  const RUN_TYPES = ["Run", "TrailRun", "VirtualRun"];
   const runs = activities.filter(a =>
-    ["Run","TrailRun","VirtualRun"].includes(a.type || a.sport_type) &&
-    a.distance >= Math.min(3000, targetM * 0.5) &&
+    RUN_TYPES.includes(a.type || a.sport_type) &&
+    a.distance >= 1500 &&
     a.moving_time > 0 &&
     (a.moving_time / (a.distance / 1609.34)) < 900
   );
   if (!runs.length) return null;
 
+  // Median speed across all runs — baseline for intensity comparison.
+  const speeds = runs.map(r => r.distance / r.moving_time).sort((a, b) => a - b);
+  const medianSpeed = speeds[Math.floor(speeds.length / 2)];
+
   let totalW = 0, weightedT = 0;
   for (const r of runs) {
-    const days   = (Date.now() - new Date(r.start_date)) / 86400000;
-    const recency = Math.exp(-days / 42);
-    const ratio   = targetM / r.distance;
-    const riegel  = r.moving_time * Math.pow(ratio, 1.06);
+    const days     = (Date.now() - new Date(r.start_date)) / 86400000;
+    const recency  = Math.exp(-days / 42);
 
-    // Correction: Riegel over-estimates on large upward extrapolations
-    const corr = ratio < 0.5 ? 0.97
-               : ratio < 1.0 ? 0.99
-               : ratio < 2.0 ? 1.00
-               : ratio < 5.0 ? 0.97
-               :               0.93;
+    // Intensity: exponential boost for faster runs. exp(8 * delta) means a run
+    // 10% faster than median gets ~2.2x weight; 10% slower gets ~0.45x.
+    const speed    = r.distance / r.moving_time;
+    const intensity = Math.exp(8 * (speed / medianSpeed - 1));
 
-    // Weight: runs closest in distance to target are the most reliable predictor
-    const distSim = Math.exp(-Math.abs(Math.log(ratio)) * 0.6);
-    const w = recency * distSim;
+    const ratio    = targetM / r.distance;
+    const riegel   = r.moving_time * Math.pow(ratio, 1.06);
 
-    weightedT += riegel * corr * w;
+    // Prefer runs closest in distance to the target race.
+    const distSim  = Math.exp(-Math.abs(Math.log(ratio)) * 0.5);
+
+    const w = recency * intensity * distSim;
+    weightedT += riegel * w;
     totalW    += w;
   }
   return totalW > 0 ? weightedT / totalW : null;
