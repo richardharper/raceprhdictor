@@ -49,7 +49,7 @@ async function apiPost(action, body) {
 }
 
 async function fetchActivities(token) {
-  const after = Math.floor((Date.now() - 56 * 24 * 60 * 60 * 1000) / 1000);
+  const after = Math.floor((Date.now() - 183 * 24 * 60 * 60 * 1000) / 1000); // ~6 months
   let all = [], page = 1;
   while (true) {
     const res = await fetch(
@@ -77,47 +77,247 @@ const ls  = { get: (k) => { try { const v = localStorage.getItem(k); return v ? 
               set: (k,v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
               del: (k)   => { try { localStorage.removeItem(k); } catch {} } };
 
-// ── Prediction ────────────────────────────────────────────────────────────────
-// Riegel formula weighted by recency, intensity, and distance similarity.
-// The key improvement over a naive weighted average is the intensity weight:
-// runs done at faster (race-like) paces dominate the prediction, while easy
-// and recovery miles contribute very little. This mirrors how Strava/Garmin
-// anchor predictions to your best efforts rather than your junk miles.
-function predictRace(activities, targetM) {
-  const RUN_TYPES = ["Run", "TrailRun", "VirtualRun"];
-  const runs = activities.filter(a =>
-    RUN_TYPES.includes(a.type || a.sport_type) &&
-    a.distance >= 1500 &&
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const RUN_TYPES = ["Run", "TrailRun", "VirtualRun"];
+
+function isRun(a) {
+  return RUN_TYPES.includes(a.type || a.sport_type) &&
+    a.distance >= 1000 &&
     a.moving_time > 0 &&
-    (a.moving_time / (a.distance / 1609.34)) < 900
-  );
+    (a.moving_time / (a.distance / 1609.34)) < 900;
+}
+
+// ── Polynomial regression (least squares) ────────────────────────────────────
+// Fits log(time) = a + b·log(dist) + c·log(dist)² to personal-best data.
+// Returns { a, b, c } or null if not enough points.
+function fitCurve(points) {
+  // points = [{ x: log(distM), y: log(timeSec) }, ...]
+  if (points.length < 3) return null;
+  const n = points.length;
+  // Build basis: [1, x, x²]
+  const X = points.map(p => [1, p.x, p.x * p.x]);
+  const Y = points.map(p => p.y);
+  // Normal equations: (XᵀX)β = XᵀY — solved directly for 3×3 system
+  function dot(a, b) { return a.reduce((s, v, i) => s + v * b[i], 0); }
+  const cols = [0,1,2].map(j => X.map(r => r[j]));
+  const XtX  = [0,1,2].map(i => [0,1,2].map(j => dot(cols[i], cols[j])));
+  const XtY  = [0,1,2].map(i => dot(cols[i], Y));
+  // Gaussian elimination
+  const M = XtX.map((r, i) => [...r, XtY[i]]);
+  for (let col = 0; col < 3; col++) {
+    let maxR = col;
+    for (let r = col+1; r < 3; r++) if (Math.abs(M[r][col]) > Math.abs(M[maxR][col])) maxR = r;
+    [M[col], M[maxR]] = [M[maxR], M[col]];
+    if (Math.abs(M[col][col]) < 1e-12) return null;
+    for (let r = 0; r < 3; r++) {
+      if (r === col) continue;
+      const f = M[r][col] / M[col][col];
+      for (let k = col; k <= 3; k++) M[r][k] -= f * M[col][k];
+    }
+  }
+  const [a, b, c] = [0,1,2].map(i => M[i][3] / M[i][i]);
+  return { a, b, c };
+}
+
+// ── Core prediction engine ────────────────────────────────────────────────────
+// Three-layer approach (inspired by Alex Gasconn's model):
+//
+// Layer 1 — Real Anchors: actual best efforts within ±10% of each distance.
+//           These are weighted 3× — hard facts beat extrapolations.
+//
+// Layer 2 — Personal-best Riegel: for each distance bracket, find the best
+//           effort and apply Riegel. Faster PBs get higher weight. Uses the
+//           runner's own exponent derived from their PB spread where possible,
+//           falling back to the standard 1.06.
+//
+// Layer 3 — Personal fatigue curve: polynomial regression on distance-bucketed
+//           PBs. Derives your personal fatigue exponent and provides a fast/slow
+//           range as honest uncertainty bounds.
+//
+// Final: pool all predictions, trim top/bottom 25%, weighted-average the middle
+// 50%. Also returns { lo, hi } range from that trimmed set.
+
+const DIST_BUCKETS = [
+  { id: "5k",   min: 4750,  max: 5250,  label: "5K"   },
+  { id: "10k",  min: 9500,  max: 10500, label: "10K"  },
+  { id: "half", min: 20000, max: 22200, label: "Half" },
+  { id: "mar",  min: 40000, max: 44400, label: "Mar"  },
+  { id: "3k",   min: 2800,  max: 3200,  label: "3K"   },
+  { id: "park", min: 4500,  max: 5500,  label: "Pk"   }, // overlaps 5K intentionally
+];
+
+function extractPBs(runs) {
+  // For each distance bucket, find the fastest effort (highest speed).
+  const pbs = {};
+  for (const bucket of DIST_BUCKETS) {
+    const inBucket = runs.filter(r => r.distance >= bucket.min && r.distance <= bucket.max);
+    if (!inBucket.length) continue;
+    const best = inBucket.reduce((b, r) => (r.distance / r.moving_time > b.distance / b.moving_time) ? r : b);
+    // Normalise to the exact bucket target distance via Riegel so different
+    // distances within a bucket are comparable.
+    const targetD = (bucket.min + bucket.max) / 2;
+    const normTime = best.moving_time * Math.pow(targetD / best.distance, 1.06);
+    pbs[bucket.id] = { distM: targetD, timeSec: normTime, rawRun: best };
+  }
+  // Also store any run longer than 15K that isn't in a standard bucket as a
+  // "long effort" anchor — useful for marathon predictions.
+  const longRuns = runs.filter(r => r.distance > 15000 &&
+    !DIST_BUCKETS.some(b => r.distance >= b.min && r.distance <= b.max));
+  if (longRuns.length) {
+    const best = longRuns.reduce((b, r) => (r.distance / r.moving_time > b.distance / b.moving_time) ? r : b);
+    pbs["long"] = { distM: best.distance, timeSec: best.moving_time, rawRun: best };
+  }
+  return pbs;
+}
+
+function riegelPredict(fromTimeSec, fromDistM, toDistM, exponent = 1.06) {
+  return fromTimeSec * Math.pow(toDistM / fromDistM, exponent);
+}
+
+function deriveExponent(pbs) {
+  // Use two well-separated PBs to derive a personal fatigue exponent:
+  //   exponent = log(T2/T1) / log(D2/D1)
+  const entries = Object.values(pbs).sort((a, b) => a.distM - b.distM);
+  if (entries.length < 2) return 1.06;
+  // Use the furthest-apart pair for stability.
+  const lo = entries[0], hi = entries[entries.length - 1];
+  const exp = Math.log(hi.timeSec / lo.timeSec) / Math.log(hi.distM / lo.distM);
+  // Clamp to a sensible range — bad data can produce extreme values.
+  return Math.min(Math.max(exp, 0.95), 1.20);
+}
+
+function predictRace(activities, targetM) {
+  const runs = activities.filter(isRun);
   if (!runs.length) return null;
 
-  // Median speed across all runs — baseline for intensity comparison.
-  const speeds = runs.map(r => r.distance / r.moving_time).sort((a, b) => a - b);
-  const medianSpeed = speeds[Math.floor(speeds.length / 2)];
+  const pbs = extractPBs(runs);
+  const pbEntries = Object.values(pbs);
+  const personalExp = deriveExponent(pbs);
+
+  const allPredictions = [];
+
+  // ── Layer 1: Real Anchors (±10% of target distance) ──────────────────────
+  const anchorRuns = runs.filter(r => {
+    const ratio = r.distance / targetM;
+    return ratio >= 0.90 && ratio <= 1.10;
+  });
+  // Sort by speed, take top 3.
+  const topAnchors = anchorRuns
+    .sort((a, b) => (b.distance / b.moving_time) - (a.distance / a.moving_time))
+    .slice(0, 3);
+  for (const r of topAnchors) {
+    const days    = (Date.now() - new Date(r.start_date)) / 86400000;
+    const recency = Math.exp(-days / 120);       // slower decay for anchors — a marathon from 4 months ago is still gold
+    const pred    = riegelPredict(r.moving_time, r.distance, targetM, personalExp);
+    allPredictions.push({ time: pred, weight: 3.0 * recency }); // 3× base weight
+  }
+
+  // ── Layer 2: Personal-best Riegel from each distance bucket ──────────────
+  for (const pb of pbEntries) {
+    if (pb.distM === targetM) continue; // handled in Layer 1
+    const days    = (Date.now() - new Date(pb.rawRun.start_date)) / 86400000;
+    const recency = Math.exp(-days / 90);
+    const speed   = pb.distM / pb.timeSec;
+    // Prefer PBs at distances closer to target.
+    const ratio   = targetM / pb.distM;
+    const distSim = Math.exp(-Math.abs(Math.log(ratio)) * 0.4);
+    const pred    = riegelPredict(pb.timeSec, pb.distM, targetM, personalExp);
+    allPredictions.push({ time: pred, weight: 1.5 * recency * distSim * speed });
+  }
+
+  // ── Layer 3: Polynomial fatigue curve ────────────────────────────────────
+  if (pbEntries.length >= 3) {
+    const points = pbEntries.map(pb => ({
+      x: Math.log(pb.distM),
+      y: Math.log(pb.timeSec),
+    }));
+    const curve = fitCurve(points);
+    if (curve) {
+      const lx   = Math.log(targetM);
+      const logy = curve.a + curve.b * lx + curve.c * lx * lx;
+      const pred = Math.exp(logy);
+      // Compute residual std-dev for uncertainty.
+      const residuals = points.map(p => {
+        const yhat = curve.a + curve.b * p.x + curve.c * p.x * p.x;
+        return p.y - yhat;
+      });
+      const mse = residuals.reduce((s, r) => s + r*r, 0) / residuals.length;
+      const se  = Math.sqrt(mse);
+      // Weight by how tight the fit is — lower se = higher confidence.
+      const confidence = Math.exp(-se * 5);
+      allPredictions.push({ time: pred, weight: 1.2 * confidence });
+      // Also push fast/slow bounds as lower-weight data points.
+      allPredictions.push({ time: Math.exp(logy - se), weight: 0.4 * confidence });
+      allPredictions.push({ time: Math.exp(logy + se), weight: 0.4 * confidence });
+    }
+  }
+
+  if (!allPredictions.length) return null;
+
+  // ── Ensemble: trim outliers, weighted-average the middle 50% ─────────────
+  allPredictions.sort((a, b) => a.time - b.time);
+  const trim = Math.floor(allPredictions.length * 0.25);
+  const middle = allPredictions.slice(trim, allPredictions.length - trim || undefined);
+  if (!middle.length) return null;
 
   let totalW = 0, weightedT = 0;
-  for (const r of runs) {
-    const days     = (Date.now() - new Date(r.start_date)) / 86400000;
-    const recency  = Math.exp(-days / 42);
-
-    // Intensity: exponential boost for faster runs. exp(8 * delta) means a run
-    // 10% faster than median gets ~2.2x weight; 10% slower gets ~0.45x.
-    const speed    = r.distance / r.moving_time;
-    const intensity = Math.exp(8 * (speed / medianSpeed - 1));
-
-    const ratio    = targetM / r.distance;
-    const riegel   = r.moving_time * Math.pow(ratio, 1.06);
-
-    // Prefer runs closest in distance to the target race.
-    const distSim  = Math.exp(-Math.abs(Math.log(ratio)) * 0.5);
-
-    const w = recency * intensity * distSim;
-    weightedT += riegel * w;
-    totalW    += w;
-  }
+  for (const p of middle) { weightedT += p.time * p.weight; totalW += p.weight; }
   return totalW > 0 ? weightedT / totalW : null;
+}
+
+// Also export a version that returns { time, lo, hi } for the UI range display.
+function predictRaceWithRange(activities, targetM) {
+  const runs = activities.filter(isRun);
+  if (!runs.length) return null;
+
+  const pbs = extractPBs(runs);
+  const pbEntries = Object.values(pbs);
+  const personalExp = deriveExponent(pbs);
+  const allPredictions = [];
+
+  const anchorRuns = runs
+    .filter(r => { const ratio = r.distance / targetM; return ratio >= 0.90 && ratio <= 1.10; })
+    .sort((a, b) => (b.distance / b.moving_time) - (a.distance / a.moving_time))
+    .slice(0, 3);
+  for (const r of anchorRuns) {
+    const days = (Date.now() - new Date(r.start_date)) / 86400000;
+    const recency = Math.exp(-days / 120);
+    allPredictions.push({ time: riegelPredict(r.moving_time, r.distance, targetM, personalExp), weight: 3.0 * recency });
+  }
+  for (const pb of pbEntries) {
+    if (pb.distM === targetM) continue;
+    const days = (Date.now() - new Date(pb.rawRun.start_date)) / 86400000;
+    const recency = Math.exp(-days / 90);
+    const distSim = Math.exp(-Math.abs(Math.log(targetM / pb.distM)) * 0.4);
+    allPredictions.push({ time: riegelPredict(pb.timeSec, pb.distM, targetM, personalExp), weight: 1.5 * recency * distSim });
+  }
+  if (pbEntries.length >= 3) {
+    const points = pbEntries.map(pb => ({ x: Math.log(pb.distM), y: Math.log(pb.timeSec) }));
+    const curve = fitCurve(points);
+    if (curve) {
+      const lx = Math.log(targetM);
+      const logy = curve.a + curve.b * lx + curve.c * lx * lx;
+      const residuals = points.map(p => { const yhat = curve.a + curve.b * p.x + curve.c * p.x * p.x; return p.y - yhat; });
+      const se = Math.sqrt(residuals.reduce((s, r) => s + r*r, 0) / residuals.length);
+      const confidence = Math.exp(-se * 5);
+      allPredictions.push({ time: Math.exp(logy), weight: 1.2 * confidence });
+      allPredictions.push({ time: Math.exp(logy - se), weight: 0.4 * confidence });
+      allPredictions.push({ time: Math.exp(logy + se), weight: 0.4 * confidence });
+    }
+  }
+  if (!allPredictions.length) return null;
+
+  allPredictions.sort((a, b) => a.time - b.time);
+  const trim = Math.floor(allPredictions.length * 0.25);
+  const middle = allPredictions.slice(trim, allPredictions.length - trim || undefined);
+  if (!middle.length) return null;
+
+  let totalW = 0, weightedT = 0;
+  for (const p of middle) { weightedT += p.time * p.weight; totalW += p.weight; }
+  const time = totalW > 0 ? weightedT / totalW : null;
+  const lo = middle[0].time;
+  const hi = middle[middle.length - 1].time;
+  return time ? { time, lo, hi } : null;
 }
 
 function buildChartData(activities, targetM) {
@@ -195,19 +395,29 @@ function Logo({ dark }) {
 }
 
 // ── Chart tooltip ─────────────────────────────────────────────────────────────
-function ChartTip({ active, payload, label }) {
+function ChartTip({ active, payload, label, distM, unit }) {
   if (!active || !payload?.length) return null;
+  const timeSec = payload[0].value;
+  // Pace = time / distance-in-chosen-unit
+  const distInUnit = unit === "km" ? distM / 1000 : distM / 1609.34;
+  const paceSecPerUnit = distInUnit > 0 ? timeSec / distInUnit : 0;
   return (
-    <div style={{ background:"white", border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"8px 13px", boxShadow:"0 4px 14px rgba(0,0,0,0.08)" }}>
-      <div style={{ color:T.accent, fontWeight:"700", fontSize:"16px", fontVariantNumeric:"tabular-nums" }}>{fmtTime(payload[0].value)}</div>
-      <div style={{ color:T.faint, fontSize:"11px", marginTop:"2px" }}>{label}</div>
+    <div style={{ background:"white", border:`1px solid ${T.border}`, borderRadius:T.radius, padding:"9px 14px", boxShadow:"0 4px 14px rgba(0,0,0,0.08)", minWidth:"120px" }}>
+      <div style={{ color:T.accent, fontWeight:"700", fontSize:"16px", fontVariantNumeric:"tabular-nums" }}>{fmtTime(timeSec)}</div>
+      {paceSecPerUnit > 0 && (
+        <div style={{ color:T.muted, fontSize:"12px", fontVariantNumeric:"tabular-nums", marginTop:"2px" }}>
+          {fmtPace(paceSecPerUnit, unit)} avg
+        </div>
+      )}
+      <div style={{ color:T.faint, fontSize:"11px", marginTop:"3px" }}>{label}</div>
     </div>
   );
 }
 
 // ── Race prediction card ──────────────────────────────────────────────────────
-function RaceCard({ race, predSec, prevSec, selected, onClick }) {
-  const diff = predSec && prevSec ? predSec - prevSec : null;
+function RaceCard({ race, pred, prevPred, selected, onClick }) {
+  // pred / prevPred are { time, lo, hi } | null
+  const diff = pred && prevPred ? pred.time - prevPred.time : null;
   return (
     <button onClick={onClick} style={{
       flex:1, textAlign:"left", background: selected ? T.accentBg : T.surface,
@@ -221,8 +431,13 @@ function RaceCard({ race, predSec, prevSec, selected, onClick }) {
         {selected && <span style={{ width:"7px", height:"7px", borderRadius:"50%", background:T.accent, flexShrink:0 }}/>}
       </div>
       <div style={{ fontSize:"30px", fontWeight:"800", color: T.text, letterSpacing:"-1px", lineHeight:1, fontVariantNumeric:"tabular-nums" }}>
-        {predSec ? fmtTime(predSec) : <span style={{ color:T.faint }}>–:––:––</span>}
+        {pred ? fmtTime(pred.time) : <span style={{ color:T.faint }}>–:––:––</span>}
       </div>
+      {pred && pred.lo && pred.hi && pred.lo !== pred.hi && (
+        <div style={{ fontSize:"10px", color:T.faint, fontVariantNumeric:"tabular-nums" }}>
+          {fmtTime(pred.lo)} – {fmtTime(pred.hi)}
+        </div>
+      )}
       <div style={{ display:"flex", alignItems:"center", gap:"8px" }}>
         <span style={{ fontSize:"11px", color:T.faint }}>{race.detail}</span>
         {diff !== null && (
@@ -360,25 +575,27 @@ export default function App() {
   function setUnit2(u) { setUnit(u); ls.set("rp-unit", u); }
 
   // ── Computed ────────────────────────────────────────────────────────────────
+  // Full predictions with lo/hi range for display.
   const predictions = useMemo(() => {
     if (!activities.length) return {};
-    return Object.fromEntries(RACES.map(r => [r.id, predictRace(activities, r.m)]));
+    return Object.fromEntries(RACES.map(r => [r.id, predictRaceWithRange(activities, r.m)]));
   }, [activities]);
 
+  // Predictions from 7 days ago — used to show trend direction on each card.
   const prevPredictions = useMemo(() => {
     if (!activities.length) return {};
-    const threeDaysAgo = new Date(); threeDaysAgo.setDate(threeDaysAgo.getDate() - 3); threeDaysAgo.setHours(23,59,59,0);
-    const subset = activities.filter(a => new Date(a.start_date) <= threeDaysAgo);
+    const sevenDaysAgo = new Date(); sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7); sevenDaysAgo.setHours(23,59,59,0);
+    const subset = activities.filter(a => new Date(a.start_date) <= sevenDaysAgo);
     if (!subset.length) return {};
-    return Object.fromEntries(RACES.map(r => [r.id, predictRace(subset, r.m)]));
+    return Object.fromEntries(RACES.map(r => [r.id, predictRaceWithRange(subset, r.m)]));
   }, [activities]);
 
   const selectedM   = RACES.find(r => r.id === selectedRace).m;
   const chartData   = useMemo(() => activities.length ? buildChartData(activities, selectedM) : [], [activities, selectedM]);
 
-  const eightWksAgo = Date.now() - 56 * 24 * 60 * 60 * 1000;
+  const sixMonthsAgo = Date.now() - 183 * 24 * 60 * 60 * 1000;
   const recentRuns  = useMemo(() =>
-    activities.filter(a => ["Run","TrailRun","VirtualRun"].includes(a.sport_type||a.type) && new Date(a.start_date).getTime() >= eightWksAgo),
+    activities.filter(a => ["Run","TrailRun","VirtualRun"].includes(a.sport_type||a.type) && new Date(a.start_date).getTime() >= sixMonthsAgo),
   [activities]);
 
   const { totalMi, avgPaceSec, runCount } = useMemo(() => {
@@ -396,6 +613,12 @@ export default function App() {
   }, [chartData, chartMin, chartMax]);
 
   const sortedActs = useMemo(() => [...activities].sort((a,b) => new Date(b.start_date)-new Date(a.start_date)), [activities]);
+
+  // The predicted time for whichever race is set as the goal target.
+  const goalRacePred = useMemo(() => {
+    if (!goalRace?.race) return null;
+    return predictions[goalRace.race]?.time ?? null;
+  }, [goalRace, predictions]);
 
   // ── Render phases ────────────────────────────────────────────────────────────
   if (phase === "init" || phase === "loading") return (
@@ -463,7 +686,7 @@ export default function App() {
         {/* Page title */}
         <div style={{ marginBottom:"22px" }}>
           <h1 style={{ fontSize:"20px", fontWeight:"800", letterSpacing:"-0.5px", margin:0 }}>Performance Predictions</h1>
-          <p style={{ fontSize:"13px", color:T.muted, marginTop:"3px" }}>Based on your last 8 weeks of Strava activities.</p>
+          <p style={{ fontSize:"13px", color:T.muted, marginTop:"3px" }}>Based on your last 6 months of Strava activities.</p>
         </div>
 
         {err && <div style={{ background:"#FEF2F2", border:"1px solid #FCA5A5", borderRadius:T.radius, padding:"10px 14px", marginBottom:"16px", fontSize:"13px", color:"#B91C1C" }}>{err}</div>}
@@ -472,8 +695,8 @@ export default function App() {
         <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:"12px", marginBottom:"16px" }}>
           {RACES.map(race => (
             <RaceCard key={race.id} race={race}
-              predSec={predictions[race.id] ?? null}
-              prevSec={prevPredictions[race.id] ?? null}
+              pred={predictions[race.id] ?? null}
+              prevPred={prevPredictions[race.id] ?? null}
               selected={selectedRace === race.id}
               onClick={() => setSelectedRace(race.id)}
             />
@@ -498,7 +721,7 @@ export default function App() {
                   <CartesianGrid strokeDasharray="3 3" stroke="#EDEBE5" vertical={false}/>
                   <XAxis dataKey="d" axisLine={false} tickLine={false} tick={{ fontSize:10.5, fill:T.faint }}/>
                   <YAxis domain={[chartMin, chartMax]} ticks={chartTicks} tickFormatter={v => fmtTime(v)} axisLine={false} tickLine={false} width={56} tick={{ fontSize:10.5, fill:T.faint }}/>
-                  <Tooltip content={<ChartTip/>}/>
+                  <Tooltip content={<ChartTip distM={selectedM} unit={unit}/>}/>
                   <Line type="monotone" dataKey="s" stroke={T.accent} strokeWidth={2.5} dot={false} activeDot={{ r:5, fill:T.accent, stroke:"white", strokeWidth:2 }}/>
                 </LineChart>
               </ResponsiveContainer>
@@ -512,7 +735,7 @@ export default function App() {
           {/* Stats column */}
           <div style={{ display:"flex", flexDirection:"column", gap:"10px" }}>
             {[
-              { label:"8-week distance", value: totalMi > 0 ? fmtDist(totalMi, unit) : "–" },
+              { label:"6-month distance", value: totalMi > 0 ? fmtDist(totalMi, unit) : "–" },
               { label:"Avg run pace",    value: avgPaceSec > 0 ? fmtPace(avgPaceSec, unit) : "–" },
               { label:"Runs logged",     value: runCount > 0 ? `${runCount} runs` : "–" },
             ].map(s => (
@@ -601,10 +824,10 @@ export default function App() {
                       <div style={{ fontSize:"20px", fontWeight:"800", letterSpacing:"-0.5px", fontVariantNumeric:"tabular-nums" }}>{goalRace.target}</div>
                     </div>
                   )}
-                  {pred && (
+                  {goalRacePred && (
                     <div style={{ textAlign:"right" }}>
                       <div style={{ fontSize:"11px", color:T.accent, fontWeight:"600", textTransform:"uppercase", letterSpacing:"0.06em" }}>Predicted</div>
-                      <div style={{ fontSize:"20px", fontWeight:"800", letterSpacing:"-0.5px", color:T.accent, fontVariantNumeric:"tabular-nums" }}>{fmtTime(pred)}</div>
+                      <div style={{ fontSize:"20px", fontWeight:"800", letterSpacing:"-0.5px", color:T.accent, fontVariantNumeric:"tabular-nums" }}>{fmtTime(goalRacePred)}</div>
                     </div>
                   )}
                   <button onClick={() => { ls.del("rp-goal"); setGoalRace(null); }} className="ghw" style={{ padding:"5px 12px", fontSize:"12px", color:T.faint, background:"white", border:`1px solid ${T.border}`, borderRadius:T.radius, cursor:"pointer" }}>Remove</button>
@@ -618,12 +841,12 @@ export default function App() {
         <div style={{ background:T.surface, border:`1px solid ${T.border}`, borderRadius:T.radiusLg, padding:"20px 22px" }}>
           <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:"16px" }}>
             <h2 style={{ fontSize:"14px", fontWeight:"700", margin:0 }}>Recent Activities</h2>
-            {sortedActs.length > 0 && <span style={{ fontSize:"12px", color:T.faint }}>{sortedActs.length} in the last 8 weeks</span>}
+            {sortedActs.length > 0 && <span style={{ fontSize:"12px", color:T.faint }}>{sortedActs.length} in the last 6 months</span>}
           </div>
 
           {sortedActs.length === 0 ? (
             <div style={{ textAlign:"center", padding:"28px 0", color:T.faint, fontSize:"13px" }}>
-              {syncing ? <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"8px" }}><div style={{ width:"14px", height:"14px", border:`2px solid ${T.accent}`, borderTopColor:"transparent", borderRadius:"50%", animation:"spin .8s linear infinite" }}/>Loading activities…</span> : "No activities in the last 8 weeks."}
+              {syncing ? <span style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:"8px" }}><div style={{ width:"14px", height:"14px", border:`2px solid ${T.accent}`, borderTopColor:"transparent", borderRadius:"50%", animation:"spin .8s linear infinite" }}/>Loading activities…</span> : "No activities in the last 6 months."}
             </div>
           ) : (
             <div style={{ overflowX:"auto" }}>
